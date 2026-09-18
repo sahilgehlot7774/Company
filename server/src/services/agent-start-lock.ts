@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 import { logger } from "../middleware/logger.js";
 
 const START_LOCK_STALE_MS = 30_000;
@@ -14,6 +16,14 @@ const startLocksByAgent = new Map<string, StartLock>();
  * atomic across agents, which is what bounds the fan-out.
  */
 let fleetRunAdmissionLock: StartLock | null = null;
+
+// The admission critical section can call back into itself: releasing an issue
+// execution applies post-commit wake effects, and a `run_queued` effect calls
+// startNextQueuedRunForAgent again. Awaiting the lock's own in-flight marker
+// from inside its holder deadlocks, so nested acquisitions on the same async
+// context run inline (the outer hold already provides exclusivity). A module
+// boolean cannot distinguish nested from concurrent callers; async context can.
+const fleetRunAdmissionContext = new AsyncLocalStorage<true>();
 
 async function waitForStartLock(
   lock: StartLock,
@@ -102,6 +112,12 @@ async function awaitLockOwner(
 }
 
 export async function withFleetRunAdmissionLock<T>(fn: () => Promise<T>) {
+  // Re-entrant call from inside the current critical section: the lock is
+  // already held on this async context, so run inline instead of waiting on
+  // our own in-flight marker.
+  if (fleetRunAdmissionContext.getStore()) {
+    return fn();
+  }
   const previous = fleetRunAdmissionLock;
   const waitForPrevious = previous
     ? awaitLockOwner(
@@ -110,7 +126,9 @@ export async function withFleetRunAdmissionLock<T>(fn: () => Promise<T>) {
         "fleet run admission lock held longer than expected; waiting for the holder to finish",
       )
     : Promise.resolve();
-  const run = waitForPrevious.then(fn);
+  const run = waitForPrevious.then(() =>
+    fleetRunAdmissionContext.run(true, fn),
+  );
   const marker = run.then(
     () => undefined,
     () => undefined,
