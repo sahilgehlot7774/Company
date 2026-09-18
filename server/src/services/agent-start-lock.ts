@@ -142,3 +142,16 @@ export async function withFleetRunAdmissionLock<T>(fn: () => Promise<T>) {
     }
   }
 }
+
+/**
+ * Detach `fn` from the current fleet admission context.
+ *
+ * Reentrancy is only correct while the critical section that owns the lock is
+ * still running. A fire-and-forget execution spawned from a lock holder must not
+ * carry the marker past that section, or its later promotion would run admission
+ * inline after the lock was released and let two count-and-claim windows
+ * overlap. `exit` runs `fn` (and the async work it creates) without the marker.
+ */
+export function runOutsideFleetRunAdmission<T>(fn: () => T): T {
+  return fleetRunAdmissionContext.exit(fn);
+}

@@ -536,6 +536,7 @@ import {
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import {
+  runOutsideFleetRunAdmission,
   withAgentStartLock,
   withFleetRunAdmissionLock,
 } from "./agent-start-lock.js";
@@ -657,15 +658,13 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 //
 // The ceiling is OFF unless the operator sets PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS.
 // A non-zero default would change run admission for every deployment, including
-// hosts with capacity for more, so this is an opt-in knob rather than a new
-// baseline.
-//
-// Set it on a constrained host to bound the instance. 2 is the measured value
-// for the 2-core / 3.0 GiB host in the 2026-09-16 stall signature
-// (evidence: t_7abdc779, t_58faaa4b): `heartbeat.maxConcurrentRuns` is per agent
-// and was at its floor of 1, so one promotion sweep queued one run for every
-// agent and started them together. Six concurrent `opencode run` children plus
-// their git-snapshot children filled the 3.0 GiB `memory.high` of
+// hosts with capacity for more, so this is a deliberate opt-in knob rather than
+// a new baseline. The knob bounds the instance on a constrained host: 2 is the
+// measured value for the 2-core / 3.0 GiB host in the 2026-09-16 stall
+// signature (evidence: t_7abdc779, t_58faaa4b). `heartbeat.maxConcurrentRuns`
+// is per agent and was at its floor of 1, so one promotion sweep queued one run
+// for every agent and started them together. Six concurrent `opencode run`
+// children plus their git-snapshot children filled the 3.0 GiB `memory.high` of
 // paperclip.service and parked the tree in mem_cgroup_handle_over. On that box
 // the children measured ~245-520 MB each (~2.0 GB total) against an app
 // MainThread of ~1.1 GB RSS plus ~0.4 GB swap, with CPUQuota=150%, so 2 is the
@@ -675,7 +674,10 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_FLEET_MAX_CONCURRENT_RUNS_MAX = 50;
 
-/** No ceiling. The fleet term is skipped unless the operator sets the env var. */
+/**
+ * No ceiling. The fleet term is skipped unless the operator explicitly opts in
+ * with PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS; see the rationale above.
+ */
 export const FLEET_MAX_CONCURRENT_RUNS_DEFAULT: number | null = null;
 export const FLEET_MAX_CONCURRENT_RUNS_ENV_VAR =
   "PAPERCLIP_MAX_CONCURRENT_AGENT_RUNS";
@@ -20022,7 +20024,13 @@ export function heartbeatService(
         if (claimedRuns.length === 0) return [];
 
         for (const claimedRun of claimedRuns) {
-          const execution = executeRun(claimedRun.id).catch((err) => {
+          // Spawn the execution outside the admission context. Otherwise the
+          // fire-and-forget run inherits the lock's reentrancy marker and a later
+          // promotion from it would run admission inline after this lock has
+          // already been released, letting two count-and-claim sections overlap.
+          const execution = runOutsideFleetRunAdmission(() =>
+            executeRun(claimedRun.id),
+          ).catch((err) => {
             logger.error(
               { err, runId: claimedRun.id },
               "queued heartbeat execution failed",
