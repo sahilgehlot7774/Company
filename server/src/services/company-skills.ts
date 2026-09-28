@@ -3377,6 +3377,35 @@ export function companySkillService(db: Db) {
     return row ? enrichFolderPath(companyId, toCompanySkill(row)) : null;
   }
 
+  /**
+   * Finds a catalog row that already points at `locator` under the legacy
+   * hashed `local/<hash>/<slug>` key. Managed-root skills imported before
+   * `deriveCanonicalSkillKey` canonicalized them still carry that key, so an
+   * import of the same directory must adopt the row instead of inserting a
+   * second entry for one directory.
+   */
+  async function findLegacyHashedLocalSkill(
+    companyId: string,
+    skill: Pick<ImportedSkill, "sourceType" | "sourceLocator">,
+    database: DbOrTransaction = db,
+  ) {
+    if (skill.sourceType !== "local_path") return null;
+    const locator = asString(skill.sourceLocator);
+    if (!locator) return null;
+    const resolved = path.resolve(locator);
+    if (!isManagedSkillDirectory(companyId, resolved)) return null;
+    const rows = await database
+      .select(selectCompanySkillColumns())
+      .from(companySkills)
+      .where(and(
+        eq(companySkills.companyId, companyId),
+        eq(companySkills.sourceType, "local_path"),
+        inArray(companySkills.sourceLocator, [locator, resolved]),
+      ));
+    const row = rows.find((candidate) => candidate.key.startsWith("local/"));
+    return row ? enrichFolderPath(companyId, toCompanySkill(row)) : null;
+  }
+
   async function getBySlugIfUnique(companyId: string, slug: string) {
     const rows = await db
       .select(selectCompanySkillColumns())
@@ -6169,10 +6198,18 @@ export function companySkillService(db: Db) {
     database: DbOrTransaction = db,
   ): Promise<CompanySkill[]> {
     const out: CompanySkill[] = [];
-    for (const skill of imported) {
-      assertImportedSkillKeyAllowed(skill);
-      assertImportedSkillSourceAllowed(skill);
-      const existing = await getByKey(companyId, skill.key, database);
+    for (const importedSkill of imported) {
+      assertImportedSkillKeyAllowed(importedSkill);
+      assertImportedSkillSourceAllowed(importedSkill);
+      const existingByKey = await getByKey(companyId, importedSkill.key, database);
+      // Keep one catalog row per managed directory: a legacy row still keyed
+      // `local/<hash>/<slug>` keeps its stored key, so agents that reference
+      // it stay attached.
+      const adopted = existingByKey
+        ? null
+        : await findLegacyHashedLocalSkill(companyId, importedSkill, database);
+      const skill = adopted ? { ...importedSkill, key: adopted.key } : importedSkill;
+      const existing = existingByKey ?? adopted;
       const existingMeta = existing ? getSkillMeta(existing) : {};
       const incomingMeta = skill.metadata && isPlainRecord(skill.metadata) ? skill.metadata : {};
       const incomingOwner = asString(incomingMeta.owner);

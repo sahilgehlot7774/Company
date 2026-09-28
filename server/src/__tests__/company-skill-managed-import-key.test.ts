@@ -1,8 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import { companies, companySkills, createDb, projects, projectWorkspaces } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -106,5 +107,46 @@ describeEmbeddedPostgres("company skill import key namespace", () => {
     // Project-scanned skills keep the hashed namespace: the same slug can live
     // under many unrelated workspace directories.
     expect(scanned.imported[0]?.key).toMatch(/^local\/[0-9a-f]{10}\/scanned-import$/);
+  }, 30_000);
+
+  it("adopts a legacy hashed row for the same managed directory instead of duplicating it", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Legacy Key Co",
+      issuePrefix: `L${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const skillDir = await writeSkill(
+      path.join(paperclipHome!, "instances", "default", "skills", companyId, "legacy-import"),
+      "legacy-import",
+    );
+    const legacyKey = `local/${createHash("sha256").update(skillDir).digest("hex").slice(0, 10)}/legacy-import`;
+    await db.insert(companySkills).values({
+      id: randomUUID(),
+      companyId,
+      key: legacyKey,
+      slug: "legacy-import",
+      name: "legacy-import",
+      markdown: "# legacy-import\n",
+      sourceType: "local_path",
+      sourceLocator: skillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+
+    const service = companySkillService(db);
+    const result = await service.importFromSource(companyId, skillDir);
+
+    // The stored key stays put: agents already reference it, and the company
+    // must not end up with two catalog rows for one directory.
+    expect(result.imported[0]?.key).toBe(legacyKey);
+    // `importFromSource` also seeds the bundled catalog, so count only the
+    // rows that point at the imported directory.
+    const rows = await db.select().from(companySkills).where(eq(companySkills.sourceLocator, skillDir));
+    expect(rows.map((row) => row.key)).toEqual([legacyKey]);
   }, 30_000);
 });
