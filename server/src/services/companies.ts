@@ -6,11 +6,38 @@ import {
   assets,
   agents,
   agentApiKeys,
+  agentConfigRevisions,
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
+  budgetIncidents,
+  budgetPolicies,
+  companySecretBindings,
+  documentAnnotationAnchorSnapshots,
+  documentAnnotationComments,
+  documentAnnotationThreads,
+  documentRevisions,
+  feedbackExports,
+  feedbackVotes,
+  heartbeatRunWatchdogDecisions,
+  inboxDismissals,
+  issueApprovals,
+  issueAttachments,
+  issueDocuments,
+  issueExecutionDecisions,
+  issueInboxArchives,
+  issuePlanDecompositions,
+  issueRecoveryActions,
+  issueReferenceMentions,
+  issueRelations,
+  issueThreadInteractions,
+  issueTreeHoldMembers,
+  issueTreeHolds,
+  issueWorkProducts,
   issues,
   issueComments,
+  projectGoals,
+  projectWorkspaces,
   projects,
   goals,
   heartbeatRuns,
@@ -28,11 +55,90 @@ import {
   companyMemberships,
   companySkills,
   documents,
+  routines,
+  secretAccessEvents,
+  workspaceRuntimeServices,
 } from "@paperclipai/db";
+import type { PgColumn, PgTable } from "drizzle-orm/pg-core";
 import { notFound, unprocessable } from "../errors.js";
 import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
+
+type CompanyScopedTable = PgTable & { companyId: PgColumn };
+
+/**
+ * Tables that must be emptied by hand before a company row can be deleted,
+ * ordered so that every table appears before the tables it points at.
+ *
+ * Only tables whose foreign keys into the company graph are `NO ACTION` /
+ * `RESTRICT` need to be here — `ON DELETE CASCADE` and `ON DELETE SET NULL`
+ * references are resolved by Postgres when the parent row goes away.
+ *
+ * Getting this list wrong is not a type error, it is a 500 at runtime on a
+ * destructive endpoint, so `companies-service-remove.test.ts` rebuilds the
+ * required set and ordering from the Drizzle schema and fails if this list
+ * drifts. If that test fails after a schema change, fix this list — do not
+ * weaken the test.
+ */
+export const COMPANY_TEARDOWN_TABLES: readonly CompanyScopedTable[] = [
+  issueReferenceMentions,
+  issueRelations,
+  activityLog,
+  agentApiKeys,
+  agentConfigRevisions,
+  agentRuntimeState,
+  agentTaskSessions,
+  financeEvents,
+  costEvents,
+  heartbeatRunEvents,
+  heartbeatRuns,
+  agentWakeupRequests,
+  approvalComments,
+  budgetIncidents,
+  approvals,
+  assets,
+  feedbackVotes,
+  issueComments,
+  issueInboxArchives,
+  issueReadStates,
+  issueThreadInteractions,
+  issueExecutionDecisions,
+  issueApprovals,
+  issueAttachments,
+  issueDocuments,
+  issuePlanDecompositions,
+  issueRecoveryActions,
+  issueTreeHoldMembers,
+  issueTreeHolds,
+  issueWorkProducts,
+  issues,
+  routines,
+  projectGoals,
+  projectWorkspaces,
+  workspaceRuntimeServices,
+  projects,
+  goals,
+  joinRequests,
+  agents,
+  budgetPolicies,
+  companyMemberships,
+  companySecretBindings,
+  secretAccessEvents,
+  companySecrets,
+  companySkills,
+  documentAnnotationAnchorSnapshots,
+  documentAnnotationComments,
+  documentAnnotationThreads,
+  documentRevisions,
+  documents,
+  feedbackExports,
+  heartbeatRunWatchdogDecisions,
+  inboxDismissals,
+  invites,
+  principalPermissionGrants,
+  companyLogos,
+];
 
 export interface CompanyActivityActor {
   actorType: "user" | "agent" | "system" | "plugin";
@@ -423,43 +529,23 @@ export function companyService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
-        // Delete from child tables in dependency order
+        // Heartbeat run events are company-scoped, but sweep them by run id too so
+        // any row that lost its company stamp cannot pin the runs in place.
         const companyRunIds = await tx
           .select({ id: heartbeatRuns.id })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.companyId, id));
-
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, id));
         if (companyRunIds.length > 0) {
           await tx
             .delete(heartbeatRunEvents)
             .where(inArray(heartbeatRunEvents.runId, companyRunIds.map((run) => run.id)));
         }
-        await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.companyId, id));
-        await tx.delete(activityLog).where(eq(activityLog.companyId, id));
-        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, id));
-        await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, id));
-        await tx.delete(agentApiKeys).where(eq(agentApiKeys.companyId, id));
-        await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.companyId, id));
-        await tx.delete(issueComments).where(eq(issueComments.companyId, id));
-        await tx.delete(costEvents).where(eq(costEvents.companyId, id));
-        await tx.delete(financeEvents).where(eq(financeEvents.companyId, id));
-        await tx.delete(approvalComments).where(eq(approvalComments.companyId, id));
-        await tx.delete(approvals).where(eq(approvals.companyId, id));
-        await tx.delete(companySecrets).where(eq(companySecrets.companyId, id));
-        await tx.delete(joinRequests).where(eq(joinRequests.companyId, id));
-        await tx.delete(invites).where(eq(invites.companyId, id));
-        await tx.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, id));
-        await tx.delete(companyMemberships).where(eq(companyMemberships.companyId, id));
-        await tx.delete(companySkills).where(eq(companySkills.companyId, id));
-        await tx.delete(issueReadStates).where(eq(issueReadStates.companyId, id));
-        await tx.delete(documents).where(eq(documents.companyId, id));
-        await tx.delete(issues).where(eq(issues.companyId, id));
-        await tx.delete(companyLogos).where(eq(companyLogos.companyId, id));
-        await tx.delete(assets).where(eq(assets.companyId, id));
-        await tx.delete(goals).where(eq(goals.companyId, id));
-        await tx.delete(projects).where(eq(projects.companyId, id));
-        await tx.delete(agents).where(eq(agents.companyId, id));
+
+        // Delete child tables in dependency order. See COMPANY_TEARDOWN_TABLES.
+        for (const table of COMPANY_TEARDOWN_TABLES) {
+          await tx.delete(table).where(eq(table.companyId, id));
+        }
+
         const rows = await tx
           .delete(companies)
           .where(eq(companies.id, id))
