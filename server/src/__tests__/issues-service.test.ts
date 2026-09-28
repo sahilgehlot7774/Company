@@ -2603,6 +2603,112 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(comments[0]?.body).toBe("Comment should be visible");
   });
 
+  it("does not wait on locked legacy comment rows while deriving attribution", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const commentId = randomUUID();
+    const runId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "LegacyCommentAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Locked legacy comment issue",
+      status: "todo",
+      priority: "medium",
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      contextSnapshot: { issueId },
+      createdAt: new Date("2026-05-12T22:58:00.000Z"),
+      startedAt: new Date("2026-05-12T22:58:00.000Z"),
+      finishedAt: new Date("2026-05-12T23:14:00.000Z"),
+    });
+
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      authorUserId: "local-board",
+      createdByRunId: runId,
+      body: "Legacy agent comment",
+      createdAt: new Date("2026-05-12T23:00:00.000Z"),
+      updatedAt: new Date("2026-05-12T23:00:00.000Z"),
+    });
+
+    const lockingDb = createDb(tempDb!.connectionString, { maxConnections: 1 });
+    const lockAcquired = deferred<void>();
+    const releaseLock = deferred<void>();
+    const lockPromise = lockingDb.transaction(async (tx) => {
+      await tx.execute(
+        sql`SELECT ${issueComments.id} FROM ${issueComments} WHERE ${issueComments.id} = ${commentId} FOR UPDATE`,
+      );
+      lockAcquired.resolve();
+      await releaseLock.promise;
+    });
+
+    await lockAcquired.promise;
+    try {
+      const startedAt = performance.now();
+      const reads = Promise.all([
+        svc.listComments(issueId, { order: "desc", limit: 50 }),
+        svc.listComments(issueId, { order: "desc", limit: 50 }),
+      ]);
+      const results = await Promise.race([
+        reads,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("comment reads waited on the locked attribution row")),
+            1_500,
+          ),
+        ),
+      ]);
+      expect(performance.now() - startedAt).toBeLessThan(1_500);
+
+      for (const comments of results) {
+        expect(comments).toHaveLength(1);
+        expect(comments[0]).toMatchObject({
+          id: commentId,
+          derivedAuthorAgentId: agentId,
+          derivedCreatedByRunId: runId,
+          derivedAuthorSource: "run_id",
+        });
+      }
+
+      const stored = await db
+        .select({ derivedAuthorAgentId: issueComments.derivedAuthorAgentId })
+        .from(issueComments)
+        .where(eq(issueComments.id, commentId))
+        .then((rows) => rows[0] ?? null);
+      expect(stored?.derivedAuthorAgentId).toBeNull();
+    } finally {
+      releaseLock.resolve();
+      await lockPromise;
+    }
+  });
+
   it("lists user comments when a candidate attribution run log is missing", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

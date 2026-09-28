@@ -6809,39 +6809,6 @@ export function issueService(db: Db) {
     return content;
   }
 
-  // Persist a resolved attribution so subsequent reads stop re-scanning run
-  // logs (and old "Board" threads stay fixed durably). Best-effort: a write
-  // failure must never break the read path. The `IS NULL` guard keeps this
-  // idempotent and avoids clobbering a value another reader just stored.
-  async function persistDerivedIssueCommentAttribution(
-    derivedByCommentId: ReadonlyMap<string, DerivedIssueCommentAttribution>,
-  ) {
-    if (derivedByCommentId.size === 0) return;
-    // One bulk `UPDATE ... FROM (VALUES ...)` so the read path is never blocked
-    // on N sequential round-trips for a large legacy thread. The `IS NULL` guard
-    // keeps this idempotent and avoids clobbering a value another reader just
-    // stored. Best-effort: a write failure must never break the read path.
-    const rows = [...derivedByCommentId].map(
-      ([commentId, derived]) =>
-        sql`(${commentId}::uuid, ${derived.derivedAuthorAgentId}::uuid, ${derived.derivedCreatedByRunId}::uuid, ${derived.derivedAuthorSource}::text)`,
-    );
-    try {
-      await db.execute(sql`
-        UPDATE ${issueComments} AS c
-        SET derived_author_agent_id = v.agent_id,
-            derived_created_by_run_id = v.run_id,
-            derived_author_source = v.source
-        FROM (VALUES ${sql.join(rows, sql`, `)}) AS v(comment_id, agent_id, run_id, source)
-        WHERE c.id = v.comment_id AND c.derived_author_agent_id IS NULL
-      `);
-    } catch (err) {
-      logger.warn(
-        { err, commentIds: [...derivedByCommentId.keys()] },
-        "failed to persist derived issue-comment attribution",
-      );
-    }
-  }
-
   async function enrichCommentsWithDerivedAgentAttribution<
     T extends {
       id: string;
@@ -7045,8 +7012,6 @@ export function issueService(db: Db) {
     }
 
     if (derivedByCommentId.size === 0) return comments;
-
-    await persistDerivedIssueCommentAttribution(derivedByCommentId);
 
     return comments.map((comment) => {
       const derived = derivedByCommentId.get(comment.id);
