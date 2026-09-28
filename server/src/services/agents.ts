@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
+import type { PgColumn, PgTable } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -9,12 +10,21 @@ import {
   agentTaskSessions,
   agentWakeupRequests,
   activityLog,
+  approvalComments,
+  approvals,
+  assets,
   costEvents,
+  financeEvents,
+  goals,
   heartbeatRunEvents,
   heartbeatRuns,
   issueExecutionDecisions,
+  issueThreadInteractions,
   issues,
   issueComments,
+  joinRequests,
+  projects,
+  routines,
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -26,6 +36,64 @@ import {
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
+
+/**
+ * How a column that points at `agents` is resolved when that agent is deleted.
+ *
+ * - `detach` — the reference is soft (an assignee, an author, a reporting line),
+ *   so the row survives with the column nulled out and history is preserved.
+ * - `delete` — the row only exists because the agent existed (runtime state,
+ *   api keys, heartbeat telemetry), so it goes away with the agent.
+ */
+export type AgentReferenceAction = "detach" | "delete";
+
+export interface AgentReferencePolicy {
+  table: PgTable;
+  column: PgColumn;
+  action: AgentReferenceAction;
+}
+
+/**
+ * Every column with a blocking (`NO ACTION`/`RESTRICT`) foreign key to `agents`,
+ * and what deleting an agent does to it. Postgres resolves `ON DELETE CASCADE`
+ * and `ON DELETE SET NULL` references for us, so those are deliberately absent.
+ *
+ * Deletes are ordered last and among themselves so that rows are removed before
+ * the rows they point at. Missing an entry here is not a type error, it is a 500
+ * on `DELETE /api/agents/:id`, so `agents-service-remove.test.ts` rebuilds this
+ * set from the Drizzle schema and fails if it drifts.
+ */
+export const AGENT_REFERENCE_POLICIES: readonly AgentReferencePolicy[] = [
+  // Soft references — keep the row, drop the link.
+  { table: agents, column: agents.reportsTo, action: "detach" },
+  { table: issues, column: issues.assigneeAgentId, action: "detach" },
+  { table: issues, column: issues.createdByAgentId, action: "detach" },
+  { table: projects, column: projects.leadAgentId, action: "detach" },
+  { table: goals, column: goals.ownerAgentId, action: "detach" },
+  { table: routines, column: routines.assigneeAgentId, action: "detach" },
+  { table: approvals, column: approvals.requestedByAgentId, action: "detach" },
+  { table: approvalComments, column: approvalComments.authorAgentId, action: "detach" },
+  { table: assets, column: assets.createdByAgentId, action: "detach" },
+  { table: joinRequests, column: joinRequests.createdAgentId, action: "detach" },
+  { table: issueThreadInteractions, column: issueThreadInteractions.createdByAgentId, action: "detach" },
+  { table: issueThreadInteractions, column: issueThreadInteractions.resolvedByAgentId, action: "detach" },
+  // Finance events are the company ledger: keep the row, drop the agent link.
+  // Its run/cost links are cleared separately before those rows are deleted.
+  { table: financeEvents, column: financeEvents.agentId, action: "detach" },
+
+  // Agent-owned rows — removed with the agent.
+  { table: activityLog, column: activityLog.agentId, action: "delete" },
+  { table: issueComments, column: issueComments.authorAgentId, action: "delete" },
+  { table: issueExecutionDecisions, column: issueExecutionDecisions.actorAgentId, action: "delete" },
+  { table: agentApiKeys, column: agentApiKeys.agentId, action: "delete" },
+  { table: agentRuntimeState, column: agentRuntimeState.agentId, action: "delete" },
+  { table: agentWakeupRequests, column: agentWakeupRequests.agentId, action: "delete" },
+  { table: agentTaskSessions, column: agentTaskSessions.agentId, action: "delete" },
+  { table: costEvents, column: costEvents.agentId, action: "delete" },
+  { table: heartbeatRunEvents, column: heartbeatRunEvents.agentId, action: "delete" },
+  // Last: everything above can point at a heartbeat run.
+  { table: heartbeatRuns, column: heartbeatRuns.agentId, action: "delete" },
+];
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -582,25 +650,45 @@ export function agentService(db: Db) {
       if (!existing) return null;
 
       return db.transaction(async (tx) => {
-        await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
+        // A routine cannot be `active` without a default agent (see
+        // normalizeDraftRoutineStatus in services/routines.ts), so pause the ones
+        // this agent owned as we unassign them rather than leaving the scheduler
+        // with an active routine and nobody to wake.
         await tx
-          .update(issues)
-          .set({ assigneeAgentId: null, createdByAgentId: null })
-          .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
-        await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
-        await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
-        await tx.delete(activityLog).where(
-          or(
-            eq(activityLog.agentId, id),
-            sql`${activityLog.runId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
-          ),
-        );
-        await tx.delete(issueExecutionDecisions).where(eq(issueExecutionDecisions.actorAgentId, id));
-        await tx.delete(issueComments).where(eq(issueComments.authorAgentId, id));
-        await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.agentId, id));
-        await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
-        await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
-        await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, id));
+          .update(routines)
+          .set({
+            assigneeAgentId: null,
+            status: sql`case when ${routines.status} = 'active' then 'paused' else ${routines.status} end`,
+            updatedAt: new Date(),
+          })
+          .where(eq(routines.assigneeAgentId, id));
+
+        // Rows that point at this agent's heartbeat runs and cost events have to be
+        // cleared before those runs and cost events are deleted below.
+        const runScope = sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id}`;
+        await tx.delete(activityLog).where(sql`${activityLog.runId} in (${runScope})`);
+        await tx
+          .update(financeEvents)
+          .set({ heartbeatRunId: null })
+          .where(sql`${financeEvents.heartbeatRunId} in (${runScope})`);
+        await tx
+          .update(financeEvents)
+          .set({ costEventId: null })
+          .where(
+            sql`${financeEvents.costEventId} in (select ${costEvents.id} from ${costEvents} where ${costEvents.agentId} = ${id})`,
+          );
+
+        // Resolve every remaining blocking reference. See AGENT_REFERENCE_POLICIES.
+        for (const policy of AGENT_REFERENCE_POLICIES) {
+          if (policy.action === "detach") {
+            await tx.execute(
+              sql`update ${policy.table} set ${sql.identifier(policy.column.name)} = null where ${policy.column} = ${id}`,
+            );
+          } else {
+            await tx.delete(policy.table).where(eq(policy.column, id));
+          }
+        }
+
         const deleted = await tx
           .delete(agents)
           .where(eq(agents.id, id))
