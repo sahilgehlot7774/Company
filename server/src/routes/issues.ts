@@ -3881,6 +3881,14 @@ export function issueRoutes(
     return resolveActorSourceTrustForIssue({ db, issue, actor });
   }
 
+  function isTaskBridgeKeyActor(req: Request) {
+    return (
+      req.actor.type === "agent" &&
+      req.actor.source === "agent_key" &&
+      req.actor.keyScope?.kind === "task_bridge"
+    );
+  }
+
   async function assertCrossIssueInfluenceWithinRunCap(
     req: Request,
     res: Response,
@@ -3888,6 +3896,9 @@ export function issueRoutes(
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
+    // A standalone task-bridge key has no worker run to count against; a bridge
+    // key that does carry a run stays under the per-run cap.
+    if (isTaskBridgeKeyActor(req) && !req.actor.runId) return true;
     if (!req.actor.agentId || !req.actor.runId)
       throw crossIssueInfluenceRunContextError();
 
@@ -4963,13 +4974,6 @@ export function issueRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
-  function isTaskBridgeKeyActor(req: Request) {
-    return (
-      req.actor.type === "agent" &&
-      req.actor.source === "agent_key" &&
-      req.actor.keyScope?.kind === "task_bridge"
-    );
-  }
 
   function isSkillTestScopedActor(req: Request) {
     return (
@@ -5332,6 +5336,12 @@ export function issueRoutes(
       );
     }
     if (issue.assigneeAgentId === null) {
+      return true;
+    }
+    // decideIssueAccess has already limited a task-bridge key to its own bridge
+    // issues. It may write them while idle, but an issue another agent is
+    // actively running keeps its run/checkout lock below.
+    if (isTaskBridgeKeyActor(req) && issue.status !== "in_progress") {
       return true;
     }
     if (issue.assigneeAgentId !== actorAgentId) {
