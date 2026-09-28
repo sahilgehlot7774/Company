@@ -677,10 +677,16 @@ function deriveCanonicalSkillKey(
   }
 
   if (input.sourceType === "local_path") {
-    if (sourceKind === "managed_local") {
+    const locator = asString(input.sourceLocator);
+    // `local/<hash>/<slug>` exists to disambiguate project-scanned skills, where
+    // the same slug can live under many unrelated directories. A skill whose
+    // directory is the company managed-skills root needs no disambiguation: its
+    // slug is already unique there, so it keeps the canonical company key even
+    // when `sourceKind` is missing or stale (e.g. imported from disk rather than
+    // authored through the skills API).
+    if (sourceKind === "managed_local" || (locator && isManagedSkillDirectory(companyId, locator))) {
       return `company/${companyId}/${slug}`;
     }
-    const locator = asString(input.sourceLocator);
     if (locator) {
       return `local/${hashSkillValue(path.resolve(locator))}/${slug}`;
     }
@@ -2395,6 +2401,21 @@ function resolveManagedSkillsRoot(companyId: string) {
 }
 
 /**
+ * True when `locator` is a Paperclip-managed skill directory for the company:
+ * a direct child of the company managed-skills root (`<managedRoot>/<slug>`).
+ * Reserved subtrees (`__catalog__/...`, `__runtime__/...`), nested paths and
+ * anything outside the root are rejected.
+ */
+function isManagedSkillDirectory(companyId: string, locator: string): boolean {
+  const managedRoot = resolveManagedSkillsRoot(companyId);
+  const relative = path.relative(managedRoot, path.resolve(locator));
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return false;
+  const segments = relative.split(path.sep);
+  // Managed skills are a direct child of the root; reject reserved `__*` dirs.
+  return segments.length === 1 && !segments[0]!.startsWith("__");
+}
+
+/**
  * A rename target must be a true Paperclip-managed local skill: a `local_path`
  * skill whose `managed_local` source directory lives directly under the
  * company managed-skills root (e.g. `<managedRoot>/<slug>`). This deliberately
@@ -2407,12 +2428,7 @@ function isPaperclipManagedRenameTarget(skill: CompanySkill): boolean {
   if (getSkillMeta(skill).sourceKind !== "managed_local") return false;
   const skillDir = normalizeSkillDirectory(skill);
   if (!skillDir) return false;
-  const managedRoot = resolveManagedSkillsRoot(skill.companyId);
-  const relative = path.relative(managedRoot, skillDir);
-  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return false;
-  const segments = relative.split(path.sep);
-  // Managed skills are a direct child of the root; reject reserved `__*` dirs.
-  return segments.length === 1 && !segments[0]!.startsWith("__");
+  return isManagedSkillDirectory(skill.companyId, skillDir);
 }
 
 function resolveLocalSkillFilePath(skill: CompanySkill, relativePath: string) {
