@@ -1,3 +1,4 @@
+// Trace fix: retain-on-failure for K-19987 PR #14354
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -47,7 +48,7 @@ export default defineConfig({
     baseURL: BASE_URL,
     headless: true,
     screenshot: "only-on-failure",
-    trace: "on-first-retry",
+    trace: "retain-on-failure",
   },
   projects: [
     {
