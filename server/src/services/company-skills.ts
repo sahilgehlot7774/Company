@@ -643,6 +643,39 @@ export const PAPERCLIP_CORE_SKILL_KEYS = [
 
 export const ONBOARDING_FIRST_TASK_SKILL_KEY = "paperclipai/paperclip/first-task";
 
+/**
+ * The path-hashed key a `local_path` skill falls back to when its directory is
+ * the only thing telling it apart from another skill with the same slug.
+ */
+function hashedLocalSkillKey(locator: string, slug: string) {
+  return `local/${hashSkillValue(path.resolve(locator))}/${slug}`;
+}
+
+/** True when both locators point at the same directory on disk. */
+function sameSkillDirectory(a: string | null | undefined, b: string | null | undefined) {
+  if (!a || !b) return false;
+  return path.resolve(a) === path.resolve(b);
+}
+
+/**
+ * True when a skill only gets the `company/<companyId>/<slug>` key because its
+ * directory sits in the company managed-skills root — the case this module
+ * canonicalizes above. The slug comes from `SKILL.md` frontmatter and need not
+ * match the directory name, so two managed directories can ask for the same
+ * key; these are the imports that must yield it to whoever already holds it.
+ */
+function claimsCompanyKeyByManagedRoot(
+  companyId: string,
+  input: Pick<ImportedSkill, "sourceType" | "sourceLocator" | "metadata">,
+) {
+  if (input.sourceType !== "local_path") return false;
+  const metadata = isPlainRecord(input.metadata) ? input.metadata : null;
+  if (readCanonicalSkillKey({}, metadata)) return false;
+  if (asString(metadata?.sourceKind) === "managed_local") return false;
+  const locator = asString(input.sourceLocator);
+  return Boolean(locator && isManagedSkillDirectory(companyId, locator));
+}
+
 function deriveCanonicalSkillKey(
   companyId: string,
   input: Pick<ImportedSkill, "slug" | "sourceType" | "sourceLocator" | "metadata">,
@@ -688,7 +721,7 @@ function deriveCanonicalSkillKey(
       return `company/${companyId}/${slug}`;
     }
     if (locator) {
-      return `local/${hashSkillValue(path.resolve(locator))}/${slug}`;
+      return hashedLocalSkillKey(locator, slug);
     }
   }
 
@@ -6201,14 +6234,33 @@ export function companySkillService(db: Db) {
     for (const importedSkill of imported) {
       assertImportedSkillKeyAllowed(importedSkill);
       assertImportedSkillSourceAllowed(importedSkill);
-      const existingByKey = await getByKey(companyId, importedSkill.key, database);
+      let candidate = importedSkill;
+      let existingByKey = await getByKey(companyId, candidate.key, database);
+      // The company key is claimed by one directory only. When another
+      // directory already holds it, this import keeps the path-hashed key
+      // instead of repointing that row at itself — the frontmatter slug need
+      // not match the directory name, so two managed directories can collide.
+      if (
+        existingByKey
+        && claimsCompanyKeyByManagedRoot(companyId, candidate)
+        && !sameSkillDirectory(existingByKey.sourceLocator, candidate.sourceLocator)
+      ) {
+        candidate = {
+          ...candidate,
+          key: hashedLocalSkillKey(
+            asString(candidate.sourceLocator) ?? "",
+            normalizeSkillSlug(candidate.slug) ?? "skill",
+          ),
+        };
+        existingByKey = await getByKey(companyId, candidate.key, database);
+      }
       // Keep one catalog row per managed directory: a legacy row still keyed
       // `local/<hash>/<slug>` keeps its stored key, so agents that reference
       // it stay attached.
       const adopted = existingByKey
         ? null
-        : await findLegacyHashedLocalSkill(companyId, importedSkill, database);
-      const skill = adopted ? { ...importedSkill, key: adopted.key } : importedSkill;
+        : await findLegacyHashedLocalSkill(companyId, candidate, database);
+      const skill = adopted ? { ...candidate, key: adopted.key } : candidate;
       const existing = existingByKey ?? adopted;
       const existingMeta = existing ? getSkillMeta(existing) : {};
       const incomingMeta = skill.metadata && isPlainRecord(skill.metadata) ? skill.metadata : {};

@@ -149,4 +149,36 @@ describeEmbeddedPostgres("company skill import key namespace", () => {
     const rows = await db.select().from(companySkills).where(eq(companySkills.sourceLocator, skillDir));
     expect(rows.map((row) => row.key)).toEqual([legacyKey]);
   }, 30_000);
+
+  it("leaves the company key with the directory that already holds it when two managed directories declare the same slug", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Slug Clash Co",
+      issuePrefix: `C${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const managedRoot = path.join(paperclipHome!, "instances", "default", "skills", companyId);
+    // Both directories declare `shared-slug` in their frontmatter, which wins
+    // over the directory name — so both ask for `company/<companyId>/shared-slug`.
+    const firstDir = await writeSkill(path.join(managedRoot, "first-dir"), "shared-slug");
+    const secondDir = await writeSkill(path.join(managedRoot, "second-dir"), "shared-slug");
+
+    const service = companySkillService(db);
+    const first = await service.importFromSource(companyId, firstDir);
+    const second = await service.importFromSource(companyId, secondDir);
+
+    expect(first.imported[0]?.key).toBe(`company/${companyId}/shared-slug`);
+    // The second directory does not repoint the first row at itself: it keeps
+    // the path-hashed key, which is exactly what that namespace is for.
+    expect(second.imported[0]?.key).toMatch(/^local\/[0-9a-f]{10}\/shared-slug$/);
+    expect(second.imported[0]?.sourceLocator).toBe(secondDir);
+
+    const firstRows = await db.select().from(companySkills).where(eq(companySkills.sourceLocator, firstDir));
+    expect(firstRows.map((row) => row.key)).toEqual([`company/${companyId}/shared-slug`]);
+    const secondRows = await db.select().from(companySkills).where(eq(companySkills.sourceLocator, secondDir));
+    expect(secondRows).toHaveLength(1);
+    expect(secondRows[0]?.key).not.toBe(`company/${companyId}/shared-slug`);
+  }, 30_000);
 });
